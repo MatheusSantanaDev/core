@@ -1,11 +1,12 @@
 """Coordinator for Spotify."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 import logging
-from typing import override
+from typing import Any, get_args, get_type_hints, override
 
 from mashumaro.exceptions import InvalidFieldValue, MissingField
+import orjson
 from spotifyaio import (
     ContextType,
     Device,
@@ -44,6 +45,7 @@ class SpotifyData:
 
 
 UPDATE_INTERVAL = timedelta(seconds=30)
+DEVICE_UPDATE_INTERVAL = timedelta(seconds=30)
 
 FREE_API_BLOGPOST = (
     "https://developer.spotify.com/blog/"
@@ -119,6 +121,8 @@ class SpotifyCoordinator(DataUpdateCoordinator[SpotifyCoordinatorData]):
             current = await self.client.get_playback()
         except SpotifyConnectionError as err:
             raise UpdateFailed("Error communicating with Spotify API") from err
+        except MissingField as err:
+            current = await self._async_repair_playback(err)
         if not current:
             return SpotifyCoordinatorData(
                 current_playback=None,
@@ -163,8 +167,11 @@ class SpotifyCoordinator(DataUpdateCoordinator[SpotifyCoordinatorData]):
                         )
                         self._playlist = None
                         self._checked_playlist_id = None
-        if current.is_playing and current.progress_ms is not None:
-            assert current.item is not None
+        if (
+            current.is_playing
+            and current.progress_ms is not None
+            and current.item is not None
+        ):
             time_left = timedelta(
                 milliseconds=current.item.duration_ms - current.progress_ms
             )
@@ -176,6 +183,30 @@ class SpotifyCoordinator(DataUpdateCoordinator[SpotifyCoordinatorData]):
             playlist=self._playlist,
             dj_playlist=dj_playlist,
         )
+
+    async def _async_repair_playback(self, err: MissingField) -> PlaybackState | None:
+        """Re-fetch and re-parse a payload that omits optional fields."""
+        _LOGGER.debug("Spotify playback payload invalid: %s", err)
+        try:
+            response = await self.client._get(  # noqa: SLF001
+                "v1/me/player", params={"additional_types": "track,episode"}
+            )
+        except SpotifyConnectionError as conn_err:
+            raise UpdateFailed("Error communicating with Spotify API") from conn_err
+        if response == "":
+            return None
+        payload: dict[str, Any] = orjson.loads(response)
+        hints = get_type_hints(PlaybackState)
+        for field in fields(PlaybackState):
+            key = field.metadata.get("alias", field.name)
+            if key not in payload and type(None) in get_args(hints[field.name]):
+                payload[key] = None
+        try:
+            return PlaybackState.from_dict(payload)
+        except MissingField as parse_err:
+            raise UpdateFailed(
+                f"Spotify playback payload missing required field: {parse_err}"
+            ) from parse_err
 
 
 class SpotifyDeviceCoordinator(DataUpdateCoordinator[list[Device]]):
@@ -195,7 +226,7 @@ class SpotifyDeviceCoordinator(DataUpdateCoordinator[list[Device]]):
             _LOGGER,
             config_entry=config_entry,
             name=f"{config_entry.title} Devices",
-            update_interval=timedelta(minutes=5),
+            update_interval=DEVICE_UPDATE_INTERVAL,
         )
         self._client = client
 
