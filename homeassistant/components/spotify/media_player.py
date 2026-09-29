@@ -2,9 +2,10 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass
 import datetime as dt
 import logging
-from typing import TYPE_CHECKING, Any, Concatenate, override
+from typing import TYPE_CHECKING, Any, Concatenate, cast, override
 
 from spotifyaio import (
     Episode,
@@ -28,7 +29,9 @@ from homeassistant.components.media_player import (
     RepeatMode,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 
 from .browse_media import async_browse_media_internal
 from .const import (
@@ -70,6 +73,31 @@ REPEAT_MODE_MAPPING_TO_SPOTIFY = {
 }
 AFTER_REQUEST_SLEEP = 1
 
+MEDIA_ATTRIBUTES_TO_RESTORE = (
+    "media_album_name",
+    "media_artist",
+    "media_content_id",
+    "media_content_type",
+    "media_duration",
+    "media_image_url",
+    "media_playlist",
+    "media_title",
+    "media_track",
+    "source",
+)
+
+
+@dataclass
+class SpotifyExtraStoredData(ExtraStoredData):
+    """Extra data stored for the Spotify media player."""
+
+    media_image_url: str | None
+
+    @override
+    def as_dict(self) -> dict[str, Any]:
+        """Return a dict representation of the extra data."""
+        return {"media_image_url": self.media_image_url}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -92,9 +120,11 @@ def ensure_item[_R](
     """Ensure that the currently playing item is available."""
 
     def wrapper(self: SpotifyMediaPlayer) -> _R | None:
-        if not self.currently_playing or not self.currently_playing.item:
-            return None
-        return func(self, self.currently_playing.item)
+        if self.currently_playing and self.currently_playing.item:
+            return func(self, self.currently_playing.item)
+        if not self.currently_playing:
+            return cast(_R | None, self._restored_attributes.get(func.__name__))
+        return None
 
     return wrapper
 
@@ -112,7 +142,7 @@ def async_refresh_after[_T: SpotifyEntity, **_P](
     return _async_wrap
 
 
-class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
+class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity, RestoreEntity):
     """Representation of a Spotify controller."""
 
     _attr_media_image_remotely_accessible = False
@@ -128,6 +158,7 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
         super().__init__(coordinator)
         self.devices = device_coordinator
         self._attr_unique_id = coordinator.current_user.user_id
+        self._restored_attributes: dict[str, Any] = {}
 
     @property
     def currently_playing(self) -> PlaybackState | None:
@@ -140,7 +171,7 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
         """Return the supported features."""
         if self.coordinator.current_user.product != ProductType.PREMIUM:
             return MediaPlayerEntityFeature(0)
-        if not self.currently_playing or self.currently_playing.device.is_restricted:
+        if self.currently_playing and self.currently_playing.device.is_restricted:
             return MediaPlayerEntityFeature.SELECT_SOURCE
         return SUPPORT_SPOTIFY
 
@@ -269,6 +300,8 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
         if self.coordinator.data.dj_playlist:
             return "DJ"
         if self.coordinator.data.playlist is None:
+            if not self.currently_playing:
+                return cast(str | None, self._restored_attributes.get("media_playlist"))
             return None
         return self.coordinator.data.playlist.name
 
@@ -277,7 +310,7 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
     def source(self) -> str | None:
         """Return the current playback device."""
         if not self.currently_playing:
-            return None
+            return cast(str | None, self._restored_attributes.get("source"))
         return self.currently_playing.device.name
 
     @property
@@ -304,6 +337,21 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
             return None
         return REPEAT_MODE_MAPPING_TO_HA.get(self.currently_playing.repeat_mode)
 
+    def _preferred_device_id(self) -> str | None:
+        """Return the device to start playback on when none is active."""
+        devices = self.devices.data
+        if not devices:
+            return None
+        last_source = self.source
+        if last_source is not None:
+            for device in devices:
+                if device.name == last_source:
+                    return device.device_id
+        for device in devices:
+            if device.is_active:
+                return device.device_id
+        return devices[0].device_id
+
     @async_refresh_after
     @override
     async def async_set_volume_level(self, volume: float) -> None:
@@ -314,7 +362,12 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
     @override
     async def async_media_play(self) -> None:
         """Start or resume playback."""
-        await self.coordinator.client.start_playback()
+        if self.currently_playing:
+            await self.coordinator.client.start_playback()
+            return
+        if (device_id := self._preferred_device_id()) is None:
+            raise HomeAssistantError("No Spotify device is available to play on")
+        await self.coordinator.client.start_playback(device_id=device_id)
 
     @async_refresh_after
     @override
@@ -372,8 +425,9 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
             _LOGGER.error("Media type %s is not supported", media_type)
             return
 
-        if not self.currently_playing and self.devices.data:
-            kwargs["device_id"] = self.devices.data[0].device_id
+        device_id = self._preferred_device_id()
+        if not self.currently_playing and device_id is not None:
+            kwargs["device_id"] = device_id
 
         if enqueue == MediaPlayerEnqueue.ADD:
             if media_type not in {
@@ -431,6 +485,26 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
             media_content_id,
         )
 
+    @property
+    @override
+    def extra_restore_state_data(self) -> ExtraStoredData | None:
+        """Return the media data to restore on the next start."""
+        if (image_url := self._restored_attributes.get("media_image_url")) is None:
+            return None
+        return SpotifyExtraStoredData(image_url)
+
+    @callback
+    @override
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if self.currently_playing:
+            self._restored_attributes = {
+                name: value
+                for name in MEDIA_ATTRIBUTES_TO_RESTORE
+                if (value := getattr(self, name)) is not None
+            }
+        super()._handle_coordinator_update()
+
     @callback
     def _handle_devices_update(self) -> None:
         """Handle updated data from the coordinator."""
@@ -445,3 +519,10 @@ class SpotifyMediaPlayer(SpotifyEntity, MediaPlayerEntity):
         self.async_on_remove(
             self.devices.async_add_listener(self._handle_devices_update)
         )
+        if self.currently_playing:
+            return
+        if (last_state := await self.async_get_last_state()) is not None:
+            self._restored_attributes = dict(last_state.attributes)
+        if (extra := await self.async_get_last_extra_data()) is not None:
+            if (image_url := extra.as_dict().get("media_image_url")) is not None:
+                self._restored_attributes["media_image_url"] = image_url

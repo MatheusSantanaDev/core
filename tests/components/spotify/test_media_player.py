@@ -2,11 +2,14 @@
 
 from dataclasses import replace
 from datetime import timedelta
+import json
 from unittest.mock import MagicMock, patch
 
 from freezegun.api import FrozenDateTimeFactory
+from mashumaro.exceptions import MissingField
 import pytest
 from spotifyaio import (
+    Context,
     PlaybackState,
     RepeatMode as SpotifyRepeatMode,
     SpotifyConnectionError,
@@ -18,12 +21,14 @@ from syrupy.assertion import SnapshotAssertion
 from homeassistant.components.media_player import (
     ATTR_INPUT_SOURCE,
     ATTR_INPUT_SOURCE_LIST,
+    ATTR_MEDIA_ARTIST,
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MEDIA_CONTENT_TYPE,
     ATTR_MEDIA_ENQUEUE,
     ATTR_MEDIA_REPEAT,
     ATTR_MEDIA_SEEK_POSITION,
     ATTR_MEDIA_SHUFFLE,
+    ATTR_MEDIA_TITLE,
     ATTR_MEDIA_VOLUME_LEVEL,
     DOMAIN as MEDIA_PLAYER_DOMAIN,
     SERVICE_PLAY_MEDIA,
@@ -35,6 +40,7 @@ from homeassistant.components.media_player import (
     RepeatMode,
 )
 from homeassistant.components.spotify import DOMAIN
+from homeassistant.components.spotify.media_player import SUPPORT_SPOTIFY
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_ENTITY_PICTURE,
@@ -49,7 +55,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     Platform,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
 
 from . import setup_integration
@@ -58,6 +64,8 @@ from tests.common import (
     MockConfigEntry,
     async_fire_time_changed,
     async_load_fixture,
+    mock_restore_cache,
+    mock_restore_cache_with_extra_data,
     snapshot_platform,
 )
 
@@ -259,9 +267,107 @@ async def test_idle(
     state = hass.states.get("media_player.spotify_spotify_1")
     assert state
     assert state.state == MediaPlayerState.IDLE
-    assert (
-        state.attributes["supported_features"] == MediaPlayerEntityFeature.SELECT_SOURCE
+    # Features stay advertised while idle so media_play is not rejected
+    assert state.attributes["supported_features"] == SUPPORT_SPOTIFY
+
+
+@pytest.mark.usefixtures("setup_credentials")
+async def test_media_play_starts_on_device(
+    hass: HomeAssistant,
+    mock_spotify: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test starting playback on a device while nothing is playing."""
+    mock_spotify.return_value.get_playback.return_value = {}
+    await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_MEDIA_PLAY,
+        {ATTR_ENTITY_ID: "media_player.spotify_spotify_1"},
+        blocking=True,
     )
+
+    mock_spotify.return_value.start_playback.assert_called_once_with(
+        device_id="21dac6b0e0a1f181870fdc9749b2656466557666"
+    )
+
+
+@pytest.mark.usefixtures("setup_credentials")
+async def test_media_play_prefers_last_source_device(
+    hass: HomeAssistant,
+    mock_spotify: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test playback resumes on the device that was last used."""
+    devices = Devices.from_json(
+        await async_load_fixture(hass, "devices.json", DOMAIN)
+    ).devices
+    active_device = replace(
+        devices[0], device_id="second-device", name="Kitchen", is_active=True
+    )
+    mock_spotify.return_value.get_devices.return_value = [active_device, devices[0]]
+    mock_spotify.return_value.get_playback.return_value = {}
+    mock_restore_cache(
+        hass,
+        [
+            State(
+                "media_player.spotify_spotify_1",
+                MediaPlayerState.IDLE,
+                {ATTR_INPUT_SOURCE: "DESKTOP-BKC5SIK"},
+            )
+        ],
+    )
+
+    await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        MEDIA_PLAYER_DOMAIN,
+        SERVICE_MEDIA_PLAY,
+        {ATTR_ENTITY_ID: "media_player.spotify_spotify_1"},
+        blocking=True,
+    )
+
+    mock_spotify.return_value.start_playback.assert_called_once_with(
+        device_id="21dac6b0e0a1f181870fdc9749b2656466557666"
+    )
+
+
+@pytest.mark.usefixtures("setup_credentials")
+async def test_restores_last_track(
+    hass: HomeAssistant,
+    mock_spotify: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the last playing track is restored after a restart."""
+    mock_spotify.return_value.get_playback.return_value = {}
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(
+                    "media_player.spotify_spotify_1",
+                    MediaPlayerState.IDLE,
+                    {
+                        ATTR_MEDIA_TITLE: "The Spirit Of Radio",
+                        ATTR_MEDIA_ARTIST: "Rush",
+                        ATTR_INPUT_SOURCE: "DESKTOP-BKC5SIK",
+                    },
+                ),
+                {"media_image_url": "https://i.scdn.co/image/abc123"},
+            )
+        ],
+    )
+
+    await setup_integration(hass, mock_config_entry)
+
+    state = hass.states.get("media_player.spotify_spotify_1")
+    assert state
+    assert state.state == MediaPlayerState.IDLE
+    assert state.attributes[ATTR_MEDIA_TITLE] == "The Spirit Of Radio"
+    assert state.attributes[ATTR_MEDIA_ARTIST] == "Rush"
+    assert state.attributes[ATTR_INPUT_SOURCE] == "DESKTOP-BKC5SIK"
+    assert state.attributes[ATTR_ENTITY_PICTURE].startswith("/api/media_player_proxy/")
 
 
 @pytest.mark.usefixtures("setup_credentials")
@@ -813,3 +919,52 @@ async def test_source_list_is_stable(
 
     assert (state := hass.states.get("media_player.spotify_spotify_1"))
     assert state.attributes[ATTR_INPUT_SOURCE_LIST] == source_list
+
+
+@pytest.mark.usefixtures("setup_credentials")
+async def test_repair_missing_optional_playback_field(
+    hass: HomeAssistant,
+    mock_spotify: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test a playback payload without optional fields still updates."""
+    mock_spotify.return_value.get_playback.side_effect = MissingField(
+        "context", Context, PlaybackState
+    )
+    mock_spotify.return_value._get.return_value = await async_load_fixture(
+        hass, "playback.json", DOMAIN
+    )
+
+    await setup_integration(hass, mock_config_entry)
+
+    state = hass.states.get("media_player.spotify_spotify_1")
+    assert state
+    assert state.state == MediaPlayerState.PLAYING
+    assert state.attributes[ATTR_MEDIA_TITLE] == "The Spirit Of Radio"
+
+
+@pytest.mark.usefixtures("setup_credentials")
+async def test_repair_unavailable_on_invalid_playback_payload(
+    hass: HomeAssistant,
+    mock_spotify: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test an unrepairable playback payload marks the entity unavailable."""
+    await setup_integration(hass, mock_config_entry)
+    assert (state := hass.states.get("media_player.spotify_spotify_1"))
+    assert state.state == MediaPlayerState.PLAYING
+
+    payload = json.loads(await async_load_fixture(hass, "playback.json", DOMAIN))
+    del payload["shuffle_state"]
+    mock_spotify.return_value.get_playback.side_effect = MissingField(
+        "shuffle", bool, PlaybackState
+    )
+    mock_spotify.return_value._get.return_value = json.dumps(payload)
+
+    freezer.tick(timedelta(seconds=30))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get("media_player.spotify_spotify_1"))
+    assert state.state == STATE_UNAVAILABLE
