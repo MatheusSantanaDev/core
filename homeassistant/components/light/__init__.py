@@ -319,15 +319,6 @@ class LightEntity(ToggleEntity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
             LightEntityCapabilityAttribute.EFFECT_LIST,
             LightEntityCapabilityAttribute.MIN_COLOR_TEMP_KELVIN,
             LightEntityCapabilityAttribute.MAX_COLOR_TEMP_KELVIN,
-            LightEntityStateAttribute.BRIGHTNESS,
-            LightEntityStateAttribute.COLOR_MODE,
-            LightEntityStateAttribute.COLOR_TEMP_KELVIN,
-            LightEntityStateAttribute.EFFECT,
-            LightEntityStateAttribute.HS_COLOR,
-            LightEntityStateAttribute.RGB_COLOR,
-            LightEntityStateAttribute.RGBW_COLOR,
-            LightEntityStateAttribute.RGBWW_COLOR,
-            LightEntityStateAttribute.XY_COLOR,
         }
     )
 
