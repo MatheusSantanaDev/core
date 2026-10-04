@@ -1021,7 +1021,7 @@ async def test_repair_unavailable_on_invalid_playback_payload(
     assert (state := hass.states.get("media_player.spotify_spotify_1"))
     assert state.state == MediaPlayerState.PLAYING
 
-    payload = json.loads(await async_load_fixture(hass, "playback.json", DOMAIN))
+    payload = await async_load_json_object_fixture(hass, "playback.json", DOMAIN)
     del payload["shuffle_state"]
     mock_spotify.return_value.get_playback.side_effect = MissingField(
         "shuffle", bool, PlaybackState
