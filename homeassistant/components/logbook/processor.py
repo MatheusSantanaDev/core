@@ -317,7 +317,7 @@ def _attributes_from_row(
 
 def _live_color_change_attributes(row: EventAsRow) -> dict[str, Any] | None:
     """Return color attributes for a live light color change event."""
-    data = row[DATA_POS]
+    data = row[DATA_POS] or {}
     old_state = data.get("old_state")
     new_state = data.get("new_state")
     if (
