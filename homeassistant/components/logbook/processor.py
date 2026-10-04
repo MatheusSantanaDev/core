@@ -58,6 +58,7 @@ from .const import (
     DOMAIN,
     EXPOSED_STATE_ATTRIBUTES,
     LIGHT_COLOR_ATTRIBUTES,
+    LIGHT_DOMAIN,
     LOGBOOK_ENTRY_ATTRIBUTES,
     LOGBOOK_ENTRY_DOMAIN,
     LOGBOOK_ENTRY_ENTITY_ID,
@@ -282,14 +283,9 @@ class EventProcessor:
 
 
 def _exposed_state_attributes(
-    row: Row | EventAsRow, attr_cache: dict[str, dict[str, Any]]
+    attributes: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Return the allowlisted state attributes for a state change row."""
-    attributes: Mapping[str, Any] | None
-    if type(row) is EventAsRow:
-        attributes = row[ATTRIBUTES_POS]
-    else:
-        attributes = decode_attributes_from_source(row[ATTRIBUTES_POS], attr_cache)
     if not attributes:
         return {}
     return {
@@ -369,8 +365,17 @@ def _state_change_entry_data(
     ):
         data[LOGBOOK_ENTRY_MESSAGE] = COLOR_CHANGED_MESSAGE
         data[LOGBOOK_ENTRY_ATTRIBUTES] = live_color_attrs
-    elif exposed := _exposed_state_attributes(row, attr_cache):
-        data[LOGBOOK_ENTRY_ATTRIBUTES] = exposed
+    else:
+        attributes = _attributes_from_row(row, attr_cache)
+        entry_attributes: dict[str, Any] = {}
+        if split_entity_id(entity_id)[0] == LIGHT_DOMAIN:
+            # Light rows carry the color they had so the UI can paint the
+            # activity row and the graph with it instead of a generic state
+            # color. Rows where only the color changed never reach here.
+            entry_attributes.update(_color_subset(attributes))
+        entry_attributes.update(_exposed_state_attributes(attributes))
+        if entry_attributes:
+            data[LOGBOOK_ENTRY_ATTRIBUTES] = entry_attributes
     return data
 
 
