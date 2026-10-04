@@ -4,7 +4,8 @@ from collections.abc import Collection
 from typing import Final
 
 import sqlalchemy
-from sqlalchemy import lambda_stmt, select, union_all
+from sqlalchemy import lambda_stmt, select, type_coerce, union_all
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import BooleanClauseList, ColumnElement
 from sqlalchemy.sql.expression import literal
 from sqlalchemy.sql.lambdas import StatementLambdaElement
@@ -12,6 +13,7 @@ from sqlalchemy.sql.selectable import Select
 
 from homeassistant.components.recorder.db_schema import (
     EVENTS_CONTEXT_ID_BIN_INDEX,
+    JSON_VARIANT_CAST,
     OLD_FORMAT_ATTRS_JSON,
     OLD_STATE,
     SHARED_ATTR_OR_LEGACY_ATTRIBUTES,
@@ -27,7 +29,13 @@ from homeassistant.components.recorder.db_schema import (
 )
 from homeassistant.components.recorder.filters import like_domain_matchers
 
-from ..const import ALWAYS_CONTINUOUS_DOMAINS, CONDITIONALLY_CONTINUOUS_DOMAINS
+from ..const import (
+    ALWAYS_CONTINUOUS_DOMAINS,
+    COLOR_CHANGE_EVENT_MARKER,
+    CONDITIONALLY_CONTINUOUS_DOMAINS,
+    LIGHT_COLOR_ATTRIBUTES,
+    LIGHT_DOMAIN,
+)
 
 # Domains that are continuous if there is a UOM set on the entity
 CONDITIONALLY_CONTINUOUS_ENTITY_ID_LIKE = like_domain_matchers(
@@ -51,6 +59,46 @@ PSEUDO_EVENT_STATE_CHANGED: Final = None
 # when we synthesize them from the states table
 # since it avoids another column being sent
 # in the payload
+
+LIGHT_ENTITY_ID_LIKE = like_domain_matchers([LIGHT_DOMAIN])
+
+OLD_STATE_ATTRIBUTES = aliased(StateAttributes, name="old_state_attributes")
+OLD_SHARED_ATTRS_JSON = type_coerce(
+    OLD_STATE_ATTRIBUTES.shared_attrs.cast(JSON_VARIANT_CAST),
+    sqlalchemy.JSON(none_as_null=True),
+)
+
+
+def color_change_condition() -> ColumnElement[bool]:
+    """Match light rows where only color attributes changed."""
+    return sqlalchemy.and_(
+        sqlalchemy.or_(
+            *[
+                StatesMeta.entity_id.like(entity_domain)
+                for entity_domain in LIGHT_ENTITY_ID_LIKE
+            ]
+        ),
+        (States.state == OLD_STATE.state),
+        sqlalchemy.or_(
+            *[
+                OLD_SHARED_ATTRS_JSON[name]
+                .as_string()
+                .is_not(SHARED_ATTRS_JSON[name].as_string())
+                for name in LIGHT_COLOR_ATTRIBUTES
+            ]
+        ),
+    )
+
+
+# Marked rows keep the same state but carry a visible color change; the
+# frontend localizes them via the message the processor attaches.
+COLOR_CHANGE_EVENT_TYPE_COLUMN = sqlalchemy.case(
+    (
+        color_change_condition(),
+        literal(COLOR_CHANGE_EVENT_MARKER, type_=sqlalchemy.String),
+    ),
+    else_=literal(PSEUDO_EVENT_STATE_CHANGED, type_=sqlalchemy.String),
+).label("event_type")
 
 EVENT_COLUMNS = (
     Events.event_id.label("row_id"),
@@ -182,7 +230,9 @@ def select_events_without_states(
 def select_states() -> Select:
     """Generate a states select that formats the states table as event rows."""
     return select(
-        *EVENT_COLUMNS_FOR_STATE_SELECT,
+        *EVENT_COLUMNS_FOR_STATE_SELECT[:1],
+        COLOR_CHANGE_EVENT_TYPE_COLUMN,
+        *EVENT_COLUMNS_FOR_STATE_SELECT[2:],
         *STATE_COLUMNS,
         NOT_CONTEXT_ONLY,
     )
@@ -193,21 +243,27 @@ def apply_states_filters(sel: Select, start_day: float, end_day: float) -> Selec
 
     Filters states that do not have an old state or new state (added / removed)
     Filters states that are in a continuous domain with a UOM.
-    Filters states that do not have matching last_updated_ts and last_changed_ts.
+    Filters states that do not have matching last_updated_ts and last_changed_ts,
+    except for light rows where only the color attributes changed.
     """
     return (
         sel.filter(
             (States.last_updated_ts > start_day) & (States.last_updated_ts < end_day)
         )
         .outerjoin(OLD_STATE, (States.old_state_id == OLD_STATE.state_id))
-        .where(_missing_state_matcher())
+        .where(_missing_state_matcher() | color_change_condition())
         .where(_not_continuous_entity_matcher())
         .where(
             (States.last_updated_ts == States.last_changed_ts)
             | States.last_changed_ts.is_(None)
+            | color_change_condition()
         )
         .outerjoin(
             StateAttributes, (States.attributes_id == StateAttributes.attributes_id)
+        )
+        .outerjoin(
+            OLD_STATE_ATTRIBUTES,
+            (OLD_STATE.attributes_id == OLD_STATE_ATTRIBUTES.attributes_id),
         )
         .outerjoin(StatesMeta, (States.metadata_id == StatesMeta.metadata_id))
     )

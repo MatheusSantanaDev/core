@@ -36,6 +36,8 @@ from .const import (
     AUTOMATION_EVENTS,
     BUILT_IN_EVENTS,
     DOMAIN,
+    LIGHT_COLOR_ATTRIBUTES,
+    LIGHT_DOMAIN,
     SENSOR_DOMAIN,
 )
 from .models import LogbookConfig
@@ -293,6 +295,18 @@ def is_sensor_continuous(
     )
 
 
+def light_color_attributes_changed(new_state: State, old_state: State) -> bool:
+    """Check if a light changed color attributes while keeping its state."""
+    if new_state.domain != LIGHT_DOMAIN or old_state.domain != LIGHT_DOMAIN:
+        return False
+    new_attributes = new_state.attributes
+    old_attributes = old_state.attributes
+    return any(
+        old_attributes.get(name) != new_attributes.get(name)
+        for name in LIGHT_COLOR_ATTRIBUTES
+    )
+
+
 def _is_state_filtered(new_state: State, old_state: State) -> bool:
     """Check if the logbook should filter a state.
 
@@ -300,8 +314,13 @@ def _is_state_filtered(new_state: State, old_state: State) -> bool:
     we only get significant changes (state.last_changed != state.last_updated)
     """
     return bool(
-        new_state.state == old_state.state
-        or new_state.last_changed != new_state.last_updated
+        (
+            (
+                new_state.state == old_state.state
+                or new_state.last_changed != new_state.last_updated
+            )
+            and not light_color_attributes_changed(new_state, old_state)
+        )
         or new_state.domain in ALWAYS_CONTINUOUS_DOMAINS
         or (
             new_state.domain == SENSOR_DOMAIN

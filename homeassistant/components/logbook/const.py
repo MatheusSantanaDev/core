@@ -17,6 +17,9 @@ ALWAYS_CONTINUOUS_DOMAINS = {"counter", "image", "proximity"}
 # Domains that are continuous if there is a UOM set on the entity
 CONDITIONALLY_CONTINUOUS_DOMAINS = {SENSOR_DOMAIN}
 
+# Light entities get color changes logged even when the state is unchanged.
+LIGHT_DOMAIN = "light"
+
 ATTR_MESSAGE = "message"
 
 DOMAIN = "logbook"
@@ -45,6 +48,22 @@ LOGBOOK_ENTRY_WHEN = "when"
 
 # State attributes surfaced in logbook entries; extend as needed.
 EXPOSED_STATE_ATTRIBUTES = {EventEntityStateAttribute.EVENT_TYPE}
+
+# Synthetic event_type marker for light rows where only color attributes
+# changed while the state itself stayed the same.
+COLOR_CHANGE_EVENT_MARKER = "color_changed"
+
+# Message the frontend localizes for color change entries.
+COLOR_CHANGED_MESSAGE = "color changed"
+
+# Light attributes that count as a visible color change.
+LIGHT_COLOR_ATTRIBUTES = (
+    "rgb_color",
+    "hs_color",
+    "xy_color",
+    "color_temp",
+    "color_temp_kelvin",
+)
 
 # Automation events that can affect an entity_id or device_id
 AUTOMATION_EVENTS = {EVENT_AUTOMATION_TRIGGERED, EVENT_SCRIPT_STARTED}

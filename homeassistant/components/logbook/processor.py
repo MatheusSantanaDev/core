@@ -43,6 +43,8 @@ from homeassistant.util.event_type import EventType
 
 from .const import (
     ATTR_MESSAGE,
+    COLOR_CHANGE_EVENT_MARKER,
+    COLOR_CHANGED_MESSAGE,
     CONTEXT_DOMAIN,
     CONTEXT_ENTITY_ID,
     CONTEXT_ENTITY_ID_NAME,
@@ -55,6 +57,7 @@ from .const import (
     CONTEXT_USER_ID,
     DOMAIN,
     EXPOSED_STATE_ATTRIBUTES,
+    LIGHT_COLOR_ATTRIBUTES,
     LOGBOOK_ENTRY_ATTRIBUTES,
     LOGBOOK_ENTRY_DOMAIN,
     LOGBOOK_ENTRY_ENTITY_ID,
@@ -65,7 +68,7 @@ from .const import (
     LOGBOOK_ENTRY_STATE,
     LOGBOOK_ENTRY_WHEN,
 )
-from .helpers import is_sensor_continuous
+from .helpers import is_sensor_continuous, light_color_attributes_changed
 from .models import (
     ATTRIBUTES_POS,
     CONTEXT_ID_BIN_POS,
@@ -73,6 +76,7 @@ from .models import (
     CONTEXT_PARENT_ID_BIN_POS,
     CONTEXT_POS,
     CONTEXT_USER_ID_BIN_POS,
+    DATA_POS,
     ENTITY_ID_POS,
     EVENT_TYPE_POS,
     ICON_POS,
@@ -295,6 +299,81 @@ def _exposed_state_attributes(
     }
 
 
+def _color_subset(attributes: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the color attributes present in the state attributes."""
+    return {
+        name: attributes[name] for name in LIGHT_COLOR_ATTRIBUTES if name in attributes
+    }
+
+
+def _attributes_from_row(
+    row: Row | EventAsRow, attr_cache: dict[str, dict[str, Any]]
+) -> Mapping[str, Any]:
+    """Decode the attributes column of a state row."""
+    if type(row) is EventAsRow:
+        return row[ATTRIBUTES_POS] or {}
+    return decode_attributes_from_source(row[ATTRIBUTES_POS], attr_cache)
+
+
+def _live_color_change_attributes(row: EventAsRow) -> dict[str, Any] | None:
+    """Return color attributes for a live light color change event."""
+    data = row[DATA_POS]
+    old_state = data.get("old_state")
+    new_state = data.get("new_state")
+    if (
+        old_state is None
+        or new_state is None
+        or old_state.state != new_state.state
+        or not light_color_attributes_changed(new_state, old_state)
+    ):
+        return None
+    return _color_subset(new_state.attributes)
+
+
+def _state_change_entry_data(
+    hass: HomeAssistant,
+    ent_reg: er.EntityRegistry,
+    row: Row | EventAsRow,
+    continuous_sensors: dict[str, bool],
+    logbook_run: LogbookRun,
+    attr_cache: dict[str, dict[str, Any]],
+    color_change_row: bool,
+) -> dict[str, Any] | None:
+    """Build a state change entry; return None when the entity is skipped."""
+    entity_id = row[ENTITY_ID_POS]
+    if TYPE_CHECKING:
+        assert entity_id is not None
+    # Skip continuous sensors
+    if (is_continuous := continuous_sensors.get(entity_id)) is None and split_entity_id(
+        entity_id
+    )[0] == SENSOR_DOMAIN:
+        is_continuous = is_sensor_continuous(hass, ent_reg, entity_id)
+        continuous_sensors[entity_id] = is_continuous
+    if is_continuous:
+        return None
+
+    data: dict[str, Any] = {
+        LOGBOOK_ENTRY_STATE: row[STATE_POS],
+        LOGBOOK_ENTRY_ENTITY_ID: entity_id,
+    }
+    if logbook_run.include_entity_name:
+        data[LOGBOOK_ENTRY_NAME] = logbook_run.entity_name_cache.get(entity_id)
+    if icon := row[ICON_POS]:
+        data[LOGBOOK_ENTRY_ICON] = icon
+    if color_change_row:
+        data[LOGBOOK_ENTRY_MESSAGE] = COLOR_CHANGED_MESSAGE
+        if color_attrs := _color_subset(_attributes_from_row(row, attr_cache)):
+            data[LOGBOOK_ENTRY_ATTRIBUTES] = color_attrs
+    elif type(row) is EventAsRow and (
+        live_color_attrs := _live_color_change_attributes(row)
+    ):
+        data[LOGBOOK_ENTRY_MESSAGE] = COLOR_CHANGED_MESSAGE
+        data[LOGBOOK_ENTRY_ATTRIBUTES] = live_color_attrs
+    elif exposed := _exposed_state_attributes(row, attr_cache):
+        data[LOGBOOK_ENTRY_ATTRIBUTES] = exposed
+    return data
+
+
 def _humanify(
     hass: HomeAssistant,
     rows: Generator[EventAsRow] | Sequence[Row] | Result,
@@ -309,8 +388,6 @@ def _humanify(
     context_lookup = logbook_run.context_lookup
     external_events = logbook_run.external_events
     event_cache_get = logbook_run.event_cache.get
-    entity_name_cache_get = logbook_run.entity_name_cache.get
-    include_entity_name = logbook_run.include_entity_name
     timestamp = logbook_run.timestamp
     memoize_new_contexts = logbook_run.memoize_new_contexts
     get_context = context_augmenter.get_context
@@ -340,29 +417,26 @@ def _humanify(
         if event_type == EVENT_CALL_SERVICE:
             continue
 
-        if event_type is PSEUDO_EVENT_STATE_CHANGED:
-            entity_id = row[ENTITY_ID_POS]
-            if TYPE_CHECKING:
-                assert entity_id is not None
-            # Skip continuous sensors
-            if (
-                is_continuous := continuous_sensors.get(entity_id)
-            ) is None and split_entity_id(entity_id)[0] == SENSOR_DOMAIN:
-                is_continuous = is_sensor_continuous(hass, ent_reg, entity_id)
-                continuous_sensors[entity_id] = is_continuous
-            if is_continuous:
-                continue
+        color_change_row = False
+        if event_type == COLOR_CHANGE_EVENT_MARKER:
+            # The query only marks light rows whose color attributes changed.
+            event_type = PSEUDO_EVENT_STATE_CHANGED
+            color_change_row = True
 
-            data = {
-                LOGBOOK_ENTRY_STATE: row[STATE_POS],
-                LOGBOOK_ENTRY_ENTITY_ID: entity_id,
-            }
-            if include_entity_name:
-                data[LOGBOOK_ENTRY_NAME] = entity_name_cache_get(entity_id)
-            if icon := row[ICON_POS]:
-                data[LOGBOOK_ENTRY_ICON] = icon
-            if exposed := _exposed_state_attributes(row, attr_cache):
-                data[LOGBOOK_ENTRY_ATTRIBUTES] = exposed
+        if event_type is PSEUDO_EVENT_STATE_CHANGED:
+            if (
+                state_data := _state_change_entry_data(
+                    hass,
+                    ent_reg,
+                    row,
+                    continuous_sensors,
+                    logbook_run,
+                    attr_cache,
+                    color_change_row,
+                )
+            ) is None:
+                continue
+            data = state_data
 
         elif event_type in external_events:
             domain, describe_event = external_events[event_type]
