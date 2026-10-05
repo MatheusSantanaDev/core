@@ -113,6 +113,7 @@ class IcloudAccount:
                 self._password,
                 self._icloud_dir.path,
                 with_family=self._with_family,
+                accept_terms=True,
             )
 
         except PyiCloudFailedLoginException:

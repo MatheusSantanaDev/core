@@ -1,6 +1,7 @@
 """Config flow to configure the iCloud integration."""
 
 from collections.abc import Mapping
+from functools import partial
 import logging
 import os
 from typing import TYPE_CHECKING, Any, override
@@ -147,13 +148,16 @@ class IcloudFlowHandler(ConfigFlow, domain=DOMAIN):
         if self.api is None:
             try:
                 self.api = await self.hass.async_add_executor_job(
-                    PyiCloudService,
-                    self._username,
-                    self._password,
-                    Store(self.hass, STORAGE_VERSION, STORAGE_KEY).path,
-                    True,
-                    None,
-                    self._with_family,
+                    partial(
+                        PyiCloudService,
+                        self._username,
+                        self._password,
+                        Store(self.hass, STORAGE_VERSION, STORAGE_KEY).path,
+                        True,
+                        None,
+                        self._with_family,
+                        accept_terms=True,
+                    )
                 )
             except PyiCloudFailedLoginException as error:
                 _LOGGER.error("Error logging into iCloud service: %s", error)
